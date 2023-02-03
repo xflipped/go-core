@@ -2,6 +2,10 @@ module git.fg-tech.ru/listware/go-core
 
 go 1.19
 
+replace git.fg-tech.ru/listware/proto => github.com/foliagecp/proto v0.1.0
+
+replace git.fg-tech.ru/listware/cmdb => github.com/foliagecp/cmdb v0.1.0
+
 require (
 	git.fg-tech.ru/listware/cmdb v0.1.0
 	git.fg-tech.ru/listware/proto v0.1.1

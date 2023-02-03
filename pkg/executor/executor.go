@@ -1,3 +1,4 @@
+// Copyright 2023 NJWS Inc.
 // Copyright 2022 Listware
 
 package executor
@@ -6,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -17,7 +19,7 @@ import (
 )
 
 const (
-	defaultBroker = "0.0.0.0:9092"
+	defaultBroker = "127.0.0.1:9092"
 
 	inputTopic = "router.system"
 )
@@ -36,15 +38,21 @@ type executor struct {
 }
 
 func New(brokers ...string) (Executor, error) {
+	if addr := os.Getenv("KAFKA_ADDR"); addr != "" {
+		brokers = append(brokers, addr)
+	}
+
 	if len(brokers) == 0 {
 		brokers = append(brokers, defaultBroker)
 	}
+
 	e := &executor{}
 
 	config := sarama.NewConfig()
 	config.Producer.Return.Successes = true
 	config.Producer.RequiredAcks = sarama.WaitForAll
 	config.Producer.Retry.Max = 5
+
 	var err error
 	if e.p, err = sarama.NewSyncProducer(brokers, config); err != nil {
 		return nil, err
@@ -74,7 +82,6 @@ func (k *executor) ExecAsync(ctx context.Context, msgs ...*pbtypes.FunctionConte
 			// Key:   sarama.StringEncoder(msg.GetId()),
 			Value: sarama.ByteEncoder(buffer.Bytes()),
 		}
-
 		if _, _, err = k.p.SendMessage(message); err != nil {
 			return
 		}
