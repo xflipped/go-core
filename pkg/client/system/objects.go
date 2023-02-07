@@ -1,3 +1,4 @@
+// Copyright 2023 NJWS, Inc.
 // Copyright 2022 Listware
 
 package system
@@ -99,6 +100,39 @@ func UpdateObject(id string, payload any) (functionContext *pbtypes.FunctionCont
 	functionContext = prepareObject(id)
 
 	objectMessage, err := UpdateObjectMessage(payload)
+	if err != nil {
+		return
+	}
+
+	if functionContext.Value, err = proto.Marshal(objectMessage); err != nil {
+		return
+	}
+	return
+}
+
+func ReplaceObjectMessage(payload any) (objectMessage *pbcmdb.ObjectMessage, err error) {
+	if payload == nil {
+		return nil, errors.ErrPayloadNil
+	}
+
+	payloadRaw, ok := payload.([]byte)
+	if !ok {
+		if payloadRaw, err = json.Marshal(payload); err != nil {
+			return
+		}
+	}
+
+	objectMessage = &pbcmdb.ObjectMessage{
+		Method:  pbcmdb.Method_REPLACE,
+		Payload: payloadRaw,
+	}
+	return
+}
+
+func ReplaceObject(id string, payload any) (functionContext *pbtypes.FunctionContext, err error) {
+	functionContext = prepareObject(id)
+
+	objectMessage, err := ReplaceObjectMessage(payload)
 	if err != nil {
 		return
 	}
