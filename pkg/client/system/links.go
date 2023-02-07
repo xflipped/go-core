@@ -1,3 +1,4 @@
+// Copyright 2023 NJWS, Inc.
 // Copyright 2022 Listware
 
 package system
@@ -86,6 +87,33 @@ func UpdateLink(from, name string, payload any) (fc *pbtypes.FunctionContext, er
 	}
 	return
 }
+
+func ReplaceLink(from, name string, payload any) (fc *pbtypes.FunctionContext, err error) {
+	if payload == nil {
+		return nil, errors.ErrPayloadNil
+	}
+
+	payloadRaw, ok := payload.([]byte)
+	if !ok {
+		if payloadRaw, err = json.Marshal(payload); err != nil {
+			return
+		}
+	}
+
+	fc = prepareLink(from)
+
+	om := &pbcmdb.LinkMessage{
+		Method:  pbcmdb.Method_REPLACE,
+		Name:    name,
+		Payload: payloadRaw,
+	}
+
+	if fc.Value, err = proto.Marshal(om); err != nil {
+		return
+	}
+	return
+}
+
 func DeleteLink(from, name string) (fc *pbtypes.FunctionContext, err error) {
 	fc = prepareLink(from)
 
