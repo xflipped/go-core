@@ -6,9 +6,7 @@ package executor
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	"git.fg-tech.ru/listware/proto/sdk/pbflink"
@@ -16,15 +14,22 @@ import (
 	"github.com/Shopify/sarama"
 	"github.com/apache/flink-statefun/statefun-sdk-go/v3/pkg/statefun"
 	"github.com/google/uuid"
+	"github.com/pkg/errors"
 )
 
 const (
 	defaultBroker = "127.0.0.1:9092"
 
-	inputTopic = "router.system"
+	defaultTopic = "router.system"
+
+	defaultBrokerEnv = "KAFKA_ADDR"
+
+	defaultTimeout = time.Second * 5
 )
 
 type Executor interface {
+	Configure(...Opt) error
+
 	ExecAsync(context.Context, ...*pbtypes.FunctionContext) error
 
 	ExecSync(context.Context, *pbtypes.FunctionContext) error
@@ -33,44 +38,85 @@ type Executor interface {
 }
 
 type executor struct {
-	p sarama.SyncProducer
-	c sarama.Consumer
+	topic   string
+	brokers []string
+	timeout time.Duration
+
+	ap sarama.AsyncProducer
+	p  sarama.SyncProducer
+	c  sarama.Consumer
 }
 
-func New(brokers ...string) (Executor, error) {
-	if addr := os.Getenv("KAFKA_ADDR"); addr != "" {
-		brokers = append(brokers, addr)
-	}
-
-	if len(brokers) == 0 {
-		brokers = append(brokers, defaultBroker)
-	}
-
+func New(opts ...Opt) (Executor, error) {
 	e := &executor{}
+	return e, e.configure(opts...)
+}
 
+func (e *executor) Configure(opts ...Opt) (err error) {
+	for _, opt := range opts {
+		if err = opt(e); err != nil {
+			return
+		}
+	}
+	return
+}
+
+func asyncConfig() *sarama.Config {
 	config := sarama.NewConfig()
-	config.Producer.Return.Successes = true
 	config.Producer.RequiredAcks = sarama.WaitForAll
 	config.Producer.Retry.Max = 5
-
-	var err error
-	if e.p, err = sarama.NewSyncProducer(brokers, config); err != nil {
-		return nil, err
-	}
-
-	if e.c, err = sarama.NewConsumer(brokers, config); err != nil {
-		return nil, err
-	}
-
-	return e, err
+	return config
 }
 
-func (k *executor) Close() {
-	k.p.Close()
-	k.c.Close()
+func syncConfig() *sarama.Config {
+	config := asyncConfig()
+	config.Producer.Return.Successes = true
+	return config
 }
 
-func (k *executor) ExecAsync(ctx context.Context, msgs ...*pbtypes.FunctionContext) (err error) {
+func (e *executor) configure(opts ...Opt) (err error) {
+	if addr, ok := os.LookupEnv(defaultBrokerEnv); ok {
+		e.brokers = append(e.brokers, addr)
+	}
+
+	if err = e.Configure(opts...); err != nil {
+		return
+	}
+
+	if e.timeout == 0 {
+		e.timeout = defaultTimeout
+	}
+
+	if e.topic == "" {
+		e.topic = defaultTopic
+	}
+
+	if len(e.brokers) == 0 {
+		e.brokers = append(e.brokers, defaultBroker)
+	}
+
+	if e.ap, err = sarama.NewAsyncProducer(e.brokers, asyncConfig()); err != nil {
+		return
+	}
+
+	if e.p, err = sarama.NewSyncProducer(e.brokers, syncConfig()); err != nil {
+		return
+	}
+
+	if e.c, err = sarama.NewConsumer(e.brokers, syncConfig()); err != nil {
+		return
+	}
+
+	return
+}
+
+func (e *executor) Close() {
+	e.ap.Close()
+	e.p.Close()
+	e.c.Close()
+}
+
+func (e *executor) ExecAsync(ctx context.Context, msgs ...*pbtypes.FunctionContext) (err error) {
 	for _, msg := range msgs {
 		var buffer bytes.Buffer
 		if err = statefun.MakeProtobufType(msg).Serialize(&buffer, msg); err != nil {
@@ -78,28 +124,24 @@ func (k *executor) ExecAsync(ctx context.Context, msgs ...*pbtypes.FunctionConte
 		}
 
 		message := &sarama.ProducerMessage{
-			Topic: inputTopic,
-			// Key:   sarama.StringEncoder(msg.GetId()),
+			Topic: e.topic,
 			Value: sarama.ByteEncoder(buffer.Bytes()),
 		}
-		if _, _, err = k.p.SendMessage(message); err != nil {
-			return
-		}
+
+		e.ap.Input() <- message
 	}
 	return
 }
 
-func (k *executor) ExecSync(ctx context.Context, msg *pbtypes.FunctionContext) (err error) {
-	ctx, cancel := context.WithTimeout(ctx, time.Second*5)
+func (e *executor) ExecSync(ctx context.Context, msg *pbtypes.FunctionContext) (err error) {
+	ctx, cancel := context.WithTimeout(ctx, e.timeout)
 	defer cancel()
 
-	replyResult := &pbtypes.ReplyResult{
+	msg.ReplyResult = &pbtypes.ReplyResult{
 		Namespace: msg.FunctionType.Namespace,
 		Topic:     msg.FunctionType.Type,
 		Key:       uuid.New().String(),
 	}
-
-	msg.ReplyResult = replyResult
 
 	var buffer bytes.Buffer
 	if err = statefun.MakeProtobufType(msg).Serialize(&buffer, msg); err != nil {
@@ -107,46 +149,48 @@ func (k *executor) ExecSync(ctx context.Context, msg *pbtypes.FunctionContext) (
 	}
 
 	message := &sarama.ProducerMessage{
-		Topic: inputTopic,
-		// Key:   sarama.StringEncoder(msg.GetId()),
+		Topic: e.topic,
 		Value: sarama.ByteEncoder(buffer.Bytes()),
 	}
 
-	consumer, err := k.c.ConsumePartition(replyResult.Topic, 0, sarama.OffsetOldest)
+	consumer, err := e.c.ConsumePartition(msg.ReplyResult.Topic, 0, sarama.OffsetOldest)
 	if err != nil {
 		return
 	}
 	defer consumer.Close()
-	inputChan := consumer.Messages()
-	errorsInput := consumer.Errors()
-	if _, _, err = k.p.SendMessage(message); err != nil {
+
+	if _, _, err = e.p.SendMessage(message); err != nil {
 		return
 	}
 
 	for {
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
-
-		case m := <-inputChan:
-			if string(m.Key) == replyResult.Key {
+		case m := <-consumer.Messages():
+			if string(m.Key) == msg.ReplyResult.Key {
 				var typedValue pbflink.TypedValue
 				if err = statefun.MakeProtobufType(&typedValue).Deserialize(bytes.NewReader(m.Value), &typedValue); err != nil {
-					return err
+					return
 				}
 
 				var functionResult pbtypes.FunctionResult
 				if err = statefun.MakeProtobufType(&functionResult).Deserialize(bytes.NewReader(typedValue.Value), &functionResult); err != nil {
-					return err
+					return
 				}
 				if !functionResult.Complete {
-					err = fmt.Errorf(strings.Join(functionResult.Errors, ";"))
+					for _, errorMessage := range functionResult.Errors {
+						if err == nil {
+							err = errors.New(errorMessage)
+						} else {
+							err = errors.Wrap(err, errorMessage)
+						}
+					}
 				}
-				return err
+				return
 			}
-		case err = <-errorsInput:
+		case err = <-consumer.Errors():
 			return
+		case <-ctx.Done():
+			return ctx.Err()
 		}
-
 	}
 }

@@ -1,3 +1,4 @@
+// Copyright 2023 NJWS, Inc.
 // Copyright 2022 Listware
 
 package system
@@ -98,6 +99,42 @@ func UpdateTypeMessage(pt *types.Type) (typeMessage *pbcmdb.TypeMessage, err err
 
 func UpdateType(pt *types.Type) (functionContext *pbtypes.FunctionContext, err error) {
 	typeMessage, err := UpdateTypeMessage(pt)
+	if err != nil {
+		return
+	}
+
+	functionContext = prepareType("types/" + pt.Schema.Title)
+
+	if functionContext.Value, err = proto.Marshal(typeMessage); err != nil {
+		return
+	}
+
+	return
+}
+
+func ReplaceTypeMessage(pt *types.Type) (typeMessage *pbcmdb.TypeMessage, err error) {
+	if pt == nil {
+		return nil, errors.ErrPayloadNil
+	}
+
+	if pt.Schema == nil {
+		return nil, errors.ErrPayloadNil
+	}
+
+	typeMessage = &pbcmdb.TypeMessage{
+		Method: pbcmdb.Method_REPLACE,
+		Name:   pt.Schema.Title,
+	}
+
+	if typeMessage.Payload, err = json.Marshal(pt); err != nil {
+		return
+	}
+
+	return
+}
+
+func ReplaceType(pt *types.Type) (functionContext *pbtypes.FunctionContext, err error) {
+	typeMessage, err := ReplaceTypeMessage(pt)
 	if err != nil {
 		return
 	}
