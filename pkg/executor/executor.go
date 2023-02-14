@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	defaultBroker = "127.0.0.1:9092"
+	defaultBroker = "kafka:9092"
 
 	defaultTopic = "router.system"
 
@@ -148,16 +148,16 @@ func (e *executor) ExecSync(ctx context.Context, msg *pbtypes.FunctionContext) (
 		return
 	}
 
-	message := &sarama.ProducerMessage{
-		Topic: e.topic,
-		Value: sarama.ByteEncoder(buffer.Bytes()),
-	}
-
-	consumer, err := e.c.ConsumePartition(msg.ReplyResult.Topic, 0, sarama.OffsetOldest)
+	consumer, err := e.c.ConsumePartition(msg.ReplyResult.Topic, 0, sarama.OffsetNewest)
 	if err != nil {
 		return
 	}
 	defer consumer.Close()
+
+	message := &sarama.ProducerMessage{
+		Topic: e.topic,
+		Value: sarama.ByteEncoder(buffer.Bytes()),
+	}
 
 	if _, _, err = e.p.SendMessage(message); err != nil {
 		return
@@ -172,10 +172,16 @@ func (e *executor) ExecSync(ctx context.Context, msg *pbtypes.FunctionContext) (
 					return
 				}
 
-				var functionResult pbtypes.FunctionResult
-				if err = statefun.MakeProtobufType(&functionResult).Deserialize(bytes.NewReader(typedValue.Value), &functionResult); err != nil {
+				var kafkaProducerRecord pbflink.KafkaProducerRecord
+				if err = statefun.MakeProtobufType(&kafkaProducerRecord).Deserialize(bytes.NewReader(typedValue.Value), &kafkaProducerRecord); err != nil {
 					return
 				}
+
+				var functionResult pbtypes.FunctionResult
+				if err = statefun.MakeProtobufType(&functionResult).Deserialize(bytes.NewReader(kafkaProducerRecord.GetValueBytes()), &functionResult); err != nil {
+					return
+				}
+
 				if !functionResult.Complete {
 					for _, errorMessage := range functionResult.Errors {
 						if err == nil {
