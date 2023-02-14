@@ -2,13 +2,13 @@ module git.fg-tech.ru/listware/go-core
 
 go 1.19
 
-replace git.fg-tech.ru/listware/proto => github.com/foliagecp/proto v0.1.3
+replace git.fg-tech.ru/listware/proto => github.com/foliagecp/proto v0.1.4
 
-replace git.fg-tech.ru/listware/cmdb => github.com/foliagecp/cmdb v0.1.4
+replace git.fg-tech.ru/listware/cmdb => github.com/foliagecp/cmdb v0.1.5
 
 require (
-	git.fg-tech.ru/listware/cmdb v0.1.4
-	git.fg-tech.ru/listware/proto v0.1.3
+	git.fg-tech.ru/listware/cmdb v0.1.5
+	git.fg-tech.ru/listware/proto v0.1.4
 	github.com/Shopify/sarama v1.38.1
 	github.com/apache/flink-statefun/statefun-sdk-go/v3 v3.2.0
 	github.com/google/uuid v1.3.0
