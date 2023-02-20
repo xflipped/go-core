@@ -4,9 +4,9 @@
 package module
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
-	"path"
 	"strings"
 	"time"
 
@@ -20,33 +20,43 @@ import (
 // StatefulFunction function interface
 type StatefulFunction func(Context) error
 
+type ResultFunction func(Context, *pbtypes.FunctionResult)
+
+type ReplyFunction func(Context, *pbtypes.ReplyResult, *pbtypes.ErrorContainer) bool
+
 // functionMiddleware adapter implemets middleware
 type functionMiddleware struct {
-	syncTableSpec statefun.ValueSpec
-	syncTable     pbtypes.SyncTable
-	// key           string
-
-	m *module
 	f StatefulFunction
+
+	states []statefun.ValueSpec
+
+	OnReply  ReplyFunction
+	OnResult ResultFunction
 }
 
 // Invoke statefun.StatefulFunction implementation
-func (fm *functionMiddleware) Invoke(ctx statefun.Context, message statefun.Message) (err error) {
-	ctx.Storage().Get(fm.syncTableSpec, &fm.syncTable)
+func (f *functionMiddleware) Invoke(ctx statefun.Context, message statefun.Message) (err error) {
 
+	// get state of sync table
+	var syncTable pbtypes.SyncTable
+	ctx.Storage().Get(syncTableSpec, &syncTable)
+
+	// if caller
 	if ctx.Caller().FunctionType != nil {
-		// log.Debug("caller", ctx.Caller())
-
+		// if functionResult message type
 		var functionResult pbtypes.FunctionResult
 		if message.Is(functionResultType) {
 			if err = message.As(functionResultType, &functionResult); err != nil {
 				return
 			}
-			fm.onResult(ctx, &functionResult)
-			return
+			// on result
+			return f.onResult(ctx, &functionResult, &syncTable)
 		}
+
+		log.Debug("caller", ctx.Caller())
 	}
 
+	// log time of function only
 	start := time.Now()
 	defer func() {
 		log.Debug(ctx.Self(), "took", time.Since(start))
@@ -58,22 +68,28 @@ func (fm *functionMiddleware) Invoke(ctx statefun.Context, message statefun.Mess
 		return
 	}
 
-	key := fm.onInit(ctx, &functionContext)
-
-	if err = fm.invoke(ctx, &functionContext, key); err != nil {
-		log.Debug(err)
-		fm.onError(ctx, key, err)
+	// prepare contextAdapter
+	context, err := f.onInit(ctx, &functionContext, &syncTable)
+	if err != nil {
+		return
 	}
 
-	fm.onReply(ctx, key)
+	// exec user function code
+	if err = f.f(context); err != nil {
+		context.AddError(err)
+	}
+
+	// if need reply to caller
+	context.checkReply()
 
 	return errors.Unwrap(err)
 }
 
-func (fm *functionMiddleware) onInit(ctx statefun.Context, functionContext *pbtypes.FunctionContext) (key string) {
-	fm.syncTable.ErrorsTable = make(map[string]*pbtypes.ErrorContainer)
-	fm.syncTable.ReplyTable = make(map[string]*pbtypes.ReplyResult)
-	fm.syncTable.ResultTable = make(map[string]string)
+func (f *functionMiddleware) onInit(ctx statefun.Context, functionContext *pbtypes.FunctionContext, syncTable *pbtypes.SyncTable) (context *contextAdapter, err error) {
+	var key string
+	syncTable.ErrorsTable = make(map[string]*pbtypes.ErrorContainer)
+	syncTable.ReplyTable = make(map[string]*pbtypes.ReplyResult)
+	syncTable.ResultTable = make(map[string]string)
 
 	if replyResult := functionContext.GetReplyResult(); replyResult != nil {
 		key = replyResult.GetKey()
@@ -84,20 +100,28 @@ func (fm *functionMiddleware) onInit(ctx statefun.Context, functionContext *pbty
 			replyResult.Egress = true
 		}
 
-		fm.syncTable.ReplyTable[key] = replyResult
+		syncTable.ReplyTable[key] = replyResult
 
 	} else {
 		key = uuid.New().String()
 	}
-	fm.syncTable.ErrorsTable[key] = &pbtypes.ErrorContainer{Complete: true}
-	ctx.Storage().Set(fm.syncTableSpec, &fm.syncTable)
+
+	if context, err = f.getContext(ctx, functionContext.Value, key, syncTable); err != nil {
+		return
+	}
+
+	// update only if no error
+	syncTable.ErrorsTable[key] = &pbtypes.ErrorContainer{Complete: true}
+	context.updateSyncTable()
+
 	return
 }
 
-func (fm *functionMiddleware) invoke(ctx statefun.Context, functionContext *pbtypes.FunctionContext, key string) (err error) {
+func (f *functionMiddleware) getContext(ctx statefun.Context, message json.RawMessage, key string, syncTable *pbtypes.SyncTable) (context *contextAdapter, err error) {
 	collectionKey := strings.Split(ctx.Self().Id, "/")
 	if len(collectionKey) != 2 {
-		return fmt.Errorf("unknown id: %+v", ctx.Self().Id)
+		err = fmt.Errorf("unknown id: %+v", ctx.Self().Id)
+		return
 	}
 
 	response, err := vertex.Read(ctx, collectionKey[1], collectionKey[0])
@@ -105,91 +129,43 @@ func (fm *functionMiddleware) invoke(ctx statefun.Context, functionContext *pbty
 		return
 	}
 
-	context := &contextAdapter{
-		fm:          fm,
-		key:         key,
+	context = &contextAdapter{
 		Context:     ctx,
-		message:     functionContext.Value,
+		states:      f.states,
+		OnReply:     f.OnReply,
+		OnResult:    f.OnResult,
+		key:         key,
+		message:     message,
 		cmdbContext: response.GetPayload(),
+		syncTable:   syncTable,
 	}
-
-	return fm.f(context)
+	return
 }
 
-func (fm *functionMiddleware) onError(ctx statefun.Context, key string, err error) {
-	if errorContainer, ok := fm.syncTable.ErrorsTable[key]; ok {
-		errorContainer.Complete = false
-		errorContainer.Errors = append(errorContainer.Errors, err.Error())
-	}
-}
-
-func (fm *functionMiddleware) onResult(ctx statefun.Context, functionResult *pbtypes.FunctionResult) {
+func (f *functionMiddleware) onResult(ctx statefun.Context, functionResult *pbtypes.FunctionResult, syncTable *pbtypes.SyncTable) (err error) {
 	replyKey := functionResult.GetReplyEgress().GetKey()
-	key := fm.syncTable.ResultTable[replyKey]
-	delete(fm.syncTable.ResultTable, replyKey)
+
+	key, ok := syncTable.ResultTable[replyKey]
+	if !ok {
+		return
+	}
+
+	delete(syncTable.ResultTable, replyKey)
 
 	if !functionResult.Complete {
-		if errorContainer, ok := fm.syncTable.ErrorsTable[key]; ok {
+		if errorContainer, ok := syncTable.ErrorsTable[key]; ok {
 			errorContainer.Complete = false
 			errorContainer.Errors = append(errorContainer.Errors, functionResult.Errors...)
 		}
 	}
 
-	ctx.Storage().Set(fm.syncTableSpec, &fm.syncTable)
-	fm.onReply(ctx, key)
-}
+	ctx.Storage().Set(syncTableSpec, syncTable)
 
-func (fm *functionMiddleware) onReply(ctx statefun.Context, key string) {
-	errorContainer, ok := fm.syncTable.ErrorsTable[key]
-	if !ok {
+	context, err := f.getContext(ctx, nil, key, syncTable)
+	if err != nil {
 		return
 	}
-
-	for _, value := range fm.syncTable.ResultTable {
-		if value == key {
-			return
-		}
-	}
-
-	delete(fm.syncTable.ErrorsTable, key)
-	ctx.Storage().Set(fm.syncTableSpec, &fm.syncTable)
-
-	replyResult, ok := fm.syncTable.ReplyTable[key]
-	if !ok {
-		return
-	}
-	delete(fm.syncTable.ReplyTable, key)
-	ctx.Storage().Set(fm.syncTableSpec, &fm.syncTable)
-
-	fm.reply(ctx, replyResult, errorContainer)
-}
-
-func (fm *functionMiddleware) reply(ctx statefun.Context, replyResult *pbtypes.ReplyResult, errorContainer *pbtypes.ErrorContainer) {
-	functionResult := &pbtypes.FunctionResult{
-		ReplyEgress: replyResult,
-		Complete:    errorContainer.Complete,
-		Errors:      errorContainer.Errors,
-	}
-
-	if !replyResult.Egress {
-		message := statefun.MessageBuilder{
-			Target: statefun.Address{
-				Id:           replyResult.GetId(),
-				FunctionType: statefun.TypeNameFrom(path.Join(replyResult.GetNamespace(), replyResult.GetTopic())),
-			},
-			Value:     functionResult,
-			ValueType: functionResultType,
-		}
-		ctx.Send(message)
-	} else {
-		kafkaEgressBuilder := statefun.KafkaEgressBuilder{
-			Target:    kafkaEgressTypeName,
-			Topic:     replyResult.Topic,
-			Key:       replyResult.Key,
-			Value:     functionResult,
-			ValueType: functionResultType,
-		}
-		ctx.SendEgress(kafkaEgressBuilder)
-	}
-
+	context.onResult(functionResult)
+	context.checkReply()
+	return
 }

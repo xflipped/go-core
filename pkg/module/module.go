@@ -19,12 +19,16 @@ var (
 	kafkaEgressTypeName = statefun.TypeNameFrom("system/output.system")
 	functionResultType  = statefun.MakeProtobufType(&pbtypes.FunctionResult{})
 	functionContextType = statefun.MakeProtobufType(&pbtypes.FunctionContext{})
-	syncTableType       = statefun.MakeProtobufType(&pbtypes.SyncTable{})
+
+	syncTableSpec = statefun.ValueSpec{
+		Name:      "sync_table",
+		ValueType: statefun.MakeProtobufType(&pbtypes.SyncTable{}),
+	}
 )
 
 type Module interface {
 	// Bind new function to module
-	Bind(string, StatefulFunction, ...statefun.ValueSpec) error
+	Bind(string, StatefulFunction, ...BindOpt) error
 
 	// RegisterAndListen register module and listen port
 	RegisterAndListen(context.Context) error
@@ -41,8 +45,6 @@ type module struct {
 	namespace string
 	port      int
 
-	states map[string][]statefun.ValueSpec
-
 	listener net.Listener
 }
 
@@ -50,7 +52,6 @@ type module struct {
 func newModule(namespace string) *module {
 	return &module{
 		builder:   statefun.StatefulFunctionsBuilder(),
-		states:    make(map[string][]statefun.ValueSpec),
 		namespace: namespace,
 	}
 }
@@ -65,19 +66,18 @@ func New(namespace string, opts ...Opt) Module {
 }
 
 // Bind new function to module
-func (m *module) Bind(methodType string, f StatefulFunction, states ...statefun.ValueSpec) error {
-	typeName := statefun.TypeNameFrom(path.Join(m.namespace, methodType))
-	m.states[typeName.String()] = states
+func (m *module) Bind(methodType string, f StatefulFunction, opts ...BindOpt) (err error) {
+	function := &functionMiddleware{f: f}
 
-	syncTableSpec := statefun.ValueSpec{
-		Name:      "sync_table",
-		ValueType: syncTableType,
+	for _, opt := range opts {
+		if err = opt(function); err != nil {
+			return
+		}
 	}
-
 	return m.builder.WithSpec(statefun.StatefulFunctionSpec{
-		FunctionType: typeName,
-		States:       append(states, syncTableSpec),
-		Function:     &functionMiddleware{m: m, f: f, syncTableSpec: syncTableSpec},
+		FunctionType: statefun.TypeNameFrom(path.Join(m.namespace, methodType)),
+		States:       append(function.states, syncTableSpec),
+		Function:     function,
 	})
 }
 
