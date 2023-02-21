@@ -24,7 +24,7 @@ const (
 
 	defaultBrokerEnv = "KAFKA_ADDR"
 
-	defaultTimeout = time.Second * 5
+	defaultTimeout = time.Second * 10
 )
 
 type Executor interface {
@@ -44,7 +44,6 @@ type executor struct {
 
 	ap sarama.AsyncProducer
 	p  sarama.SyncProducer
-	c  sarama.Consumer
 }
 
 func New(opts ...Opt) (Executor, error) {
@@ -71,6 +70,8 @@ func asyncConfig() *sarama.Config {
 func syncConfig() *sarama.Config {
 	config := asyncConfig()
 	config.Producer.Return.Successes = true
+	config.Consumer.Offsets.Initial = sarama.OffsetNewest
+	config.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.BalanceStrategyRange}
 	return config
 }
 
@@ -103,17 +104,12 @@ func (e *executor) configure(opts ...Opt) (err error) {
 		return
 	}
 
-	if e.c, err = sarama.NewConsumer(e.brokers, syncConfig()); err != nil {
-		return
-	}
-
 	return
 }
 
 func (e *executor) Close() {
 	e.ap.Close()
 	e.p.Close()
-	e.c.Close()
 }
 
 func (e *executor) ExecAsync(ctx context.Context, msgs ...*pbtypes.FunctionContext) (err error) {
@@ -148,16 +144,31 @@ func (e *executor) ExecSync(ctx context.Context, msg *pbtypes.FunctionContext) (
 		return
 	}
 
-	consumer, err := e.c.ConsumePartition(msg.ReplyResult.Topic, 0, sarama.OffsetNewest)
+	consumerGroup, err := sarama.NewConsumerGroup(e.brokers, msg.ReplyResult.Key, syncConfig())
 	if err != nil {
 		return
 	}
-	defer consumer.Close()
+	defer consumerGroup.Close()
 
 	message := &sarama.ProducerMessage{
 		Topic: e.topic,
 		Value: sarama.ByteEncoder(buffer.Bytes()),
 	}
+
+	c := &Consumer{
+		ready:  make(chan bool),
+		key:    msg.ReplyResult.Key,
+		output: make(chan error),
+	}
+
+	go func() {
+		if err := consumerGroup.Consume(ctx, []string{msg.ReplyResult.Topic}, c); err != nil {
+			cancel()
+			return
+		}
+	}()
+
+	<-c.ready
 
 	if _, _, err = e.p.SendMessage(message); err != nil {
 		return
@@ -165,38 +176,76 @@ func (e *executor) ExecSync(ctx context.Context, msg *pbtypes.FunctionContext) (
 
 	for {
 		select {
-		case m := <-consumer.Messages():
-			if string(m.Key) == msg.ReplyResult.Key {
-				var typedValue pbflink.TypedValue
-				if err = statefun.MakeProtobufType(&typedValue).Deserialize(bytes.NewReader(m.Value), &typedValue); err != nil {
-					return
-				}
-
-				var kafkaProducerRecord pbflink.KafkaProducerRecord
-				if err = statefun.MakeProtobufType(&kafkaProducerRecord).Deserialize(bytes.NewReader(typedValue.Value), &kafkaProducerRecord); err != nil {
-					return
-				}
-
-				var functionResult pbtypes.FunctionResult
-				if err = statefun.MakeProtobufType(&functionResult).Deserialize(bytes.NewReader(kafkaProducerRecord.GetValueBytes()), &functionResult); err != nil {
-					return
-				}
-
-				if !functionResult.Complete {
-					for _, errorMessage := range functionResult.Errors {
-						if err == nil {
-							err = errors.New(errorMessage)
-						} else {
-							err = errors.Wrap(err, errorMessage)
-						}
-					}
-				}
-				return
-			}
-		case err = <-consumer.Errors():
-			return
 		case <-ctx.Done():
 			return ctx.Err()
+
+		case err = <-c.output:
+			return err
 		}
 	}
+
+	return
+}
+
+type Consumer struct {
+	ready chan bool
+
+	key string
+
+	output chan error
+}
+
+func (consumer *Consumer) Setup(s sarama.ConsumerGroupSession) error {
+	close(consumer.ready)
+	return nil
+}
+
+func (consumer *Consumer) Cleanup(s sarama.ConsumerGroupSession) error {
+	return nil
+}
+
+func (consumer *Consumer) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) (err error) {
+	for {
+		select {
+		case m := <-claim.Messages():
+			session.MarkMessage(m, "")
+
+			if string(m.Key) == consumer.key {
+				consumer.output <- readResult(m.Value)
+				return
+			}
+
+		case <-session.Context().Done():
+			return session.Context().Err()
+		}
+	}
+}
+
+func readResult(value []byte) (err error) {
+	var typedValue pbflink.TypedValue
+	if err = statefun.MakeProtobufType(&typedValue).Deserialize(bytes.NewReader(value), &typedValue); err != nil {
+		return
+	}
+
+	var kafkaProducerRecord pbflink.KafkaProducerRecord
+	if err = statefun.MakeProtobufType(&kafkaProducerRecord).Deserialize(bytes.NewReader(typedValue.Value), &kafkaProducerRecord); err != nil {
+		return
+	}
+
+	var functionResult pbtypes.FunctionResult
+	if err = statefun.MakeProtobufType(&functionResult).Deserialize(bytes.NewReader(kafkaProducerRecord.GetValueBytes()), &functionResult); err != nil {
+		return
+	}
+
+	if !functionResult.Complete {
+		for _, errorMessage := range functionResult.Errors {
+			if err == nil {
+				err = errors.New(errorMessage)
+			} else {
+				err = errors.Wrap(err, errorMessage)
+			}
+		}
+	}
+
+	return
 }
