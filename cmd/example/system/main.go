@@ -18,7 +18,7 @@ var (
 
 func main() {
 	var err error
-	exec, err = executor.New("127.0.0.1:9092")
+	exec, err = executor.New(executor.WithBroker("127.0.0.1:9092"))
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -31,7 +31,6 @@ func main() {
 		fmt.Println(err)
 		return
 	}
-	return
 }
 
 type NodeContainer struct{}
@@ -50,6 +49,7 @@ func register(ctx context.Context) (err error) {
 	}
 	_ = nodeType
 
+	// nolint
 	registerTypes = append(registerTypes, nodeContainerType, nodeType)
 
 	var registerObjects = []*pbcmdb.RegisterObjectMessage{}

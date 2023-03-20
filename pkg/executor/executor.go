@@ -184,7 +184,6 @@ func (e *executor) ExecSync(ctx context.Context, msg *pbtypes.FunctionContext) (
 		}
 	}
 
-	return
 }
 
 type Consumer struct {
